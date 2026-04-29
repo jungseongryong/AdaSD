@@ -1,3 +1,5 @@
+import warnings
+
 import torch
 
 
@@ -60,6 +62,10 @@ class SelfDistillationDataCollator:
         if self.off_policy:
             print(f"[DataCollator] Teacher context column: {self.teacher_context_column}")
             print(f"[DataCollator] Trajectory column: {self.trajectory_column}")
+        self._warned_student_prompt_truncation = False
+        self._warned_teacher_prompt_truncation = False
+        self._warned_reasoning_prompt_truncation = False
+        self._warned_trajectory_truncation = False
 
     def __call__(self, features):
 
@@ -128,7 +134,14 @@ class SelfDistillationDataCollator:
             if self.off_policy:
                 reference_trajectories.append(reference_trajectory)
 
-        # Tokenize WITHOUT padding first to get true lengths
+        # Tokenize WITHOUT padding first to get true lengths. We also measure
+        # untruncated lengths so truncation is visible during inspection runs.
+        student_encoded_full = self.tokenizer(
+            student_prompts,
+            padding=False,
+            truncation=False,
+        )
+        student_prompt_full_lengths = [len(ids) for ids in student_encoded_full["input_ids"]]
         student_encoded_no_pad = self.tokenizer(
             student_prompts,
             padding=False,
@@ -136,6 +149,17 @@ class SelfDistillationDataCollator:
             max_length=self.max_length,
         )
         student_prompt_lengths = [len(ids) for ids in student_encoded_no_pad["input_ids"]]
+        if (
+            any(length > self.max_length for length in student_prompt_full_lengths)
+            and not self._warned_student_prompt_truncation
+        ):
+            max_full_len = max(student_prompt_full_lengths)
+            warnings.warn(
+                "[DataCollator] Student prompt truncation occurred: "
+                f"max_untruncated_length={max_full_len}, max_length={self.max_length}.",
+                stacklevel=2,
+            )
+            self._warned_student_prompt_truncation = True
 
         # Find max lengths in this batch
         max_student_prompt_len = max(student_prompt_lengths)
@@ -159,6 +183,14 @@ class SelfDistillationDataCollator:
 
         if self.reason_first:
             # Tokenize reasoning prompts
+            reasoning_encoded_full = self.tokenizer(
+                teacher_reasoning_prompts,
+                padding=False,
+                truncation=False,
+            )
+            reasoning_prompt_full_lengths = [
+                len(ids) for ids in reasoning_encoded_full["input_ids"]
+            ]
             reasoning_encoded_no_pad = self.tokenizer(
                 teacher_reasoning_prompts,
                 padding=False,
@@ -166,6 +198,17 @@ class SelfDistillationDataCollator:
                 max_length=self.max_length,
             )
             reasoning_prompt_lengths = [len(ids) for ids in reasoning_encoded_no_pad["input_ids"]]
+            if (
+                any(length > self.max_length for length in reasoning_prompt_full_lengths)
+                and not self._warned_reasoning_prompt_truncation
+            ):
+                max_full_len = max(reasoning_prompt_full_lengths)
+                warnings.warn(
+                    "[DataCollator] Teacher reasoning prompt truncation occurred: "
+                    f"max_untruncated_length={max_full_len}, max_length={self.max_length}.",
+                    stacklevel=2,
+                )
+                self._warned_reasoning_prompt_truncation = True
             max_reasoning_prompt_len = max(reasoning_prompt_lengths)
 
             reasoning_encoded = self.tokenizer(
@@ -196,6 +239,14 @@ class SelfDistillationDataCollator:
             )
         else:
             # Normal mode: tokenize teacher prompts
+            teacher_encoded_full = self.tokenizer(
+                teacher_prompts,
+                padding=False,
+                truncation=False,
+            )
+            teacher_prompt_full_lengths = [
+                len(ids) for ids in teacher_encoded_full["input_ids"]
+            ]
             teacher_encoded_no_pad = self.tokenizer(
                 teacher_prompts,
                 padding=False,
@@ -203,6 +254,18 @@ class SelfDistillationDataCollator:
                 max_length=self.max_length,
             )
             teacher_prompt_lengths = [len(ids) for ids in teacher_encoded_no_pad["input_ids"]]
+            if (
+                any(length > self.max_length for length in teacher_prompt_full_lengths)
+                and not self._warned_teacher_prompt_truncation
+            ):
+                max_full_len = max(teacher_prompt_full_lengths)
+                warnings.warn(
+                    "[DataCollator] Teacher prompt truncation occurred: "
+                    f"max_untruncated_length={max_full_len}, max_length={self.max_length}. "
+                    "If off_policy=True, this can leave little or no room for the reference trajectory.",
+                    stacklevel=2,
+                )
+                self._warned_teacher_prompt_truncation = True
             max_teacher_prompt_len = max(teacher_prompt_lengths)
 
             teacher_encoded = self.tokenizer(
@@ -234,7 +297,24 @@ class SelfDistillationDataCollator:
             max_prompt_len_for_trajectory = max(
                 result["student_prompt_length"], result["teacher_prompt_length"]
             )
-            max_trajectory_len = max(1, self.max_length - max_prompt_len_for_trajectory)
+            max_trajectory_len = self.max_length - max_prompt_len_for_trajectory
+            if max_trajectory_len <= 0:
+                raise ValueError(
+                    "No room left for off-policy reference trajectory. "
+                    f"max_length={self.max_length}, "
+                    f"student_prompt_length={result['student_prompt_length']}, "
+                    f"teacher_prompt_length={result['teacher_prompt_length']}. "
+                    "Increase max_length, shorten teacher_context, or filter this sample."
+                )
+            trajectory_encoded_full = self.tokenizer(
+                trajectory_texts,
+                padding=False,
+                truncation=False,
+                add_special_tokens=False,
+            )
+            trajectory_full_lengths = [
+                len(ids) for ids in trajectory_encoded_full["input_ids"]
+            ]
             trajectory_encoded_no_pad = self.tokenizer(
                 trajectory_texts,
                 padding=False,
@@ -243,6 +323,25 @@ class SelfDistillationDataCollator:
                 add_special_tokens=False,
             )
             trajectory_lengths = [len(ids) for ids in trajectory_encoded_no_pad["input_ids"]]
+            trajectory_truncated = [
+                full_len > max_trajectory_len for full_len in trajectory_full_lengths
+            ]
+            if any(trajectory_truncated) and not self._warned_trajectory_truncation:
+                truncated_count = sum(trajectory_truncated)
+                max_full_len = max(trajectory_full_lengths)
+                max_removed = max(
+                    full_len - max_trajectory_len for full_len in trajectory_full_lengths
+                )
+                warnings.warn(
+                    "[DataCollator] Off-policy reference trajectory truncation occurred: "
+                    f"{truncated_count}/{len(trajectory_texts)} examples in this batch, "
+                    f"max_untruncated_length={max_full_len}, "
+                    f"max_trajectory_len={max_trajectory_len}, "
+                    f"max_removed_tokens={max_removed}. "
+                    "Loss will be computed only on the kept prefix of the trajectory.",
+                    stacklevel=2,
+                )
+                self._warned_trajectory_truncation = True
             max_trajectory_batch_len = max(trajectory_lengths)
 
             trajectory_encoded = self.tokenizer(
@@ -259,6 +358,12 @@ class SelfDistillationDataCollator:
                     "reference_trajectory_ids": trajectory_encoded["input_ids"],
                     "reference_trajectory_attention_mask": trajectory_encoded["attention_mask"],
                     "reference_trajectory_lengths_per_example": torch.tensor(trajectory_lengths),
+                    "reference_trajectory_full_lengths_per_example": torch.tensor(
+                        trajectory_full_lengths
+                    ),
+                    "reference_trajectory_truncated_per_example": torch.tensor(
+                        trajectory_truncated
+                    ),
                 }
             )
 

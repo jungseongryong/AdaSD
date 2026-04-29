@@ -92,6 +92,27 @@ class CustomScriptArguments(ScriptArguments):
             "Typical range: 0.99–0.9999. Only used when use_ema_teacher=True."
         },
     )
+    off_policy: bool = field(
+        default=False,
+        metadata={
+            "help": "Use dataset trajectories for self-distillation instead of sampling trajectories from "
+            "the current student policy."
+        },
+    )
+    teacher_context_column: str = field(
+        default="solution",
+        metadata={
+            "help": "Dataset column used as the privileged teacher context. Defaults to 'solution'. "
+            "Set this to a separate fixed-context column when your dataset provides one."
+        },
+    )
+    trajectory_column: str = field(
+        default="solution",
+        metadata={
+            "help": "Dataset column used as the off-policy trajectory to match distributions on. "
+            "Defaults to 'solution'."
+        },
+    )
 
 
 if __name__ == "__main__":
@@ -135,6 +156,8 @@ if __name__ == "__main__":
         # Add fixed_teacher to wandb name if enabled
         if script_args.fixed_teacher:
             full_wandb_run_config += "_fixteach"
+        if script_args.off_policy:
+            full_wandb_run_config += "_offpolicy"
 
     # Print configuration info
     print(f"\n{'='*80}")
@@ -151,6 +174,11 @@ if __name__ == "__main__":
     if script_args.fixed_teacher and not model_args.use_peft:
         raise ValueError(
             "fixed_teacher=True requires use_peft=True. As the fixed teacher is implemented by disabling LoRA adapters."
+        )
+    if script_args.off_policy and script_args.use_tinker_loss:
+        raise ValueError(
+            "off_policy=True currently supports the full-vocabulary JSD/KL objective only. "
+            "Disable --use_tinker_loss for off-policy self-distillation."
         )
 
     # Only initialize wandb on main process (LOCAL_RANK 0 or not set)
@@ -178,6 +206,9 @@ if __name__ == "__main__":
                 "num_processes": num_processes,
                 "use_tinker_loss": script_args.use_tinker_loss,
                 "fixed_teacher": script_args.fixed_teacher,
+                "off_policy": script_args.off_policy,
+                "teacher_context_column": script_args.teacher_context_column,
+                "trajectory_column": script_args.trajectory_column,
                 "top_k_loss": script_args.top_k_loss if script_args.top_k_loss > 0 else None,
                 "use_ema_teacher": script_args.use_ema_teacher,
                 "ema_decay": script_args.ema_decay if script_args.use_ema_teacher else None,
@@ -266,6 +297,9 @@ if __name__ == "__main__":
         jsd_token_clip=script_args.jsd_token_clip if script_args.jsd_token_clip > 0 else None,
         use_ema_teacher=script_args.use_ema_teacher,
         ema_decay=script_args.ema_decay,
+        off_policy=script_args.off_policy,
+        teacher_context_column=script_args.teacher_context_column,
+        trajectory_column=script_args.trajectory_column,
     )
 
     if training_args.eval_strategy != "no":

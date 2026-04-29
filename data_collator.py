@@ -12,10 +12,21 @@ class SelfDistillationDataCollator:
     within each batch, and track the actual (unpadded) prompt lengths for loss masking.
     """
 
-    def __init__(self, tokenizer, max_length=2048, reason_first=True):
+    def __init__(
+        self,
+        tokenizer,
+        max_length=2048,
+        reason_first=True,
+        off_policy=False,
+        teacher_context_column="solution",
+        trajectory_column="solution",
+    ):
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.reason_first = reason_first
+        self.off_policy = off_policy
+        self.teacher_context_column = teacher_context_column
+        self.trajectory_column = trajectory_column
 
         # Prompt for reasoning about the solution before teaching
         self.reason_first_prompt = (
@@ -38,6 +49,10 @@ class SelfDistillationDataCollator:
         self.tokenizer.padding_side = "right"
         print(f"[DataCollator] Set padding_side to: {self.tokenizer.padding_side}")
         print(f"[DataCollator] Reason first mode: {self.reason_first}")
+        print(f"[DataCollator] Off-policy mode: {self.off_policy}")
+        if self.off_policy:
+            print(f"[DataCollator] Teacher context column: {self.teacher_context_column}")
+            print(f"[DataCollator] Trajectory column: {self.trajectory_column}")
 
     def __call__(self, features):
 
@@ -47,12 +62,15 @@ class SelfDistillationDataCollator:
         student_prompts = []
         teacher_prompts = []
         teacher_reasoning_prompts = []  # NEW: for reason_first mode
+        reference_trajectories = []
 
         for feature in features:
             # Extract problem and solution from dataset
             # Handle different possible column names
             problem = feature["problem"]
             solution = feature["solution"]
+            teacher_context = feature.get(self.teacher_context_column, solution)
+            reference_trajectory = feature.get(self.trajectory_column, solution)
 
             # Student prompt: just the problem with instruction (matching evaluation format)
             student_user_message = f"Problem: {problem}\n\nPlease reason step by step, and put your final answer within \\boxed{{}}."
@@ -70,7 +88,7 @@ class SelfDistillationDataCollator:
                     f"Problem: {problem}\n\n"
                     f"Here is a correct reasoning to this problem:"
                     f"=== Reference Reasoning Start ===\n"
-                    f"{solution}\n"
+                    f"{teacher_context}\n"
                     f"=== Reference Reasoning End ===\n\n"
                     f"{self.reason_first_prompt}"
                 )
@@ -88,7 +106,7 @@ class SelfDistillationDataCollator:
                 teacher_user_message = (
                     f"Problem: {problem}\n\n"
                     f"Here is a reference solution to this problem:\n"
-                    f"=== Reference Solution Begin ===\n{solution}\n=== Reference Solution End ===\n"
+                    f"=== Reference Solution Begin ===\n{teacher_context}\n=== Reference Solution End ===\n"
                     f"{self.transition_prompt}\n"
                     f"Please reason step by step, and put your final answer within \\boxed{{}}."
                 )
@@ -99,6 +117,9 @@ class SelfDistillationDataCollator:
                     teacher_messages, tokenize=False, add_generation_prompt=True, enable_thinking=True
                 )
                 teacher_prompts.append(teacher_prompt)
+
+            if self.off_policy:
+                reference_trajectories.append(reference_trajectory)
 
         # Tokenize WITHOUT padding first to get true lengths
         student_encoded_no_pad = self.tokenizer(
@@ -128,6 +149,43 @@ class SelfDistillationDataCollator:
             # Keep individual lengths for proper masking
             "student_prompt_lengths_per_example": torch.tensor(student_prompt_lengths),
         }
+
+        if self.off_policy:
+            eos = self.tokenizer.eos_token or ""
+            trajectory_texts = []
+            for trajectory in reference_trajectories:
+                trajectory = str(trajectory)
+                if eos and not trajectory.endswith(eos):
+                    trajectory = trajectory + eos
+                trajectory_texts.append(trajectory)
+
+            max_trajectory_len = max(1, self.max_length - max_student_prompt_len)
+            trajectory_encoded_no_pad = self.tokenizer(
+                trajectory_texts,
+                padding=False,
+                truncation=True,
+                max_length=max_trajectory_len,
+                add_special_tokens=False,
+            )
+            trajectory_lengths = [len(ids) for ids in trajectory_encoded_no_pad["input_ids"]]
+            max_trajectory_batch_len = max(trajectory_lengths)
+
+            trajectory_encoded = self.tokenizer(
+                trajectory_texts,
+                padding="max_length",
+                truncation=True,
+                max_length=max_trajectory_batch_len,
+                return_tensors="pt",
+                add_special_tokens=False,
+            )
+
+            result.update(
+                {
+                    "reference_trajectory_ids": trajectory_encoded["input_ids"],
+                    "reference_trajectory_attention_mask": trajectory_encoded["attention_mask"],
+                    "reference_trajectory_lengths_per_example": torch.tensor(trajectory_lengths),
+                }
+            )
 
         if self.reason_first:
             # Tokenize reasoning prompts

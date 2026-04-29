@@ -142,9 +142,15 @@ class OPSDTrainer(SFTTrainer):
         jsd_token_clip: float | None = None,
         use_ema_teacher: bool = False,
         ema_decay: float = 0.999,
+        off_policy: bool = False,
+        teacher_context_column: str = "solution",
+        trajectory_column: str = "solution",
     ):
         self.model_name_or_path = model if isinstance(model, str) else model.config._name_or_path
         self.model_revision = getattr(args, "student_model_revision", None)
+        self.off_policy = off_policy
+        self.teacher_context_column = teacher_context_column
+        self.trajectory_column = trajectory_column
         if isinstance(model, str) and self.model_revision is not None:
             args.model_init_kwargs = args.model_init_kwargs or {}
             args.model_init_kwargs.setdefault("revision", self.model_revision)
@@ -152,7 +158,12 @@ class OPSDTrainer(SFTTrainer):
         # Custom data collator for self-distillation
         if data_collator is None:
             data_collator = SelfDistillationDataCollator(
-                tokenizer=processing_class, max_length=args.max_length, reason_first=reason_first
+                tokenizer=processing_class,
+                max_length=args.max_length,
+                reason_first=reason_first,
+                off_policy=off_policy,
+                teacher_context_column=teacher_context_column,
+                trajectory_column=trajectory_column,
             )
 
         super().__init__(
@@ -218,6 +229,14 @@ class OPSDTrainer(SFTTrainer):
             print(f"\n{'='*80}")
             print("REASON FIRST MODE ENABLED")
             print("Teacher will first reason about the privileged solution, then evaluate student's response")
+            print(f"{'='*80}\n")
+
+        if self.off_policy:
+            print(f"\n{'='*80}")
+            print("OFF-POLICY SELF-DISTILLATION MODE ENABLED")
+            print("Student generation is skipped; distribution matching runs on dataset trajectories.")
+            print(f"Teacher context column: {self.teacher_context_column}")
+            print(f"Trajectory column: {self.trajectory_column}")
             print(f"{'='*80}\n")
 
         # Track per-step loss statistics for on/off-policy batches (used in logging)
@@ -365,6 +384,9 @@ class OPSDTrainer(SFTTrainer):
             "problem",
             "solution",
         ]
+        for column in [self.teacher_context_column, self.trajectory_column]:
+            if column and column not in required_columns:
+                required_columns.append(column)
         if self._signature_columns is None:
             self._signature_columns = required_columns
         else:
@@ -1285,18 +1307,21 @@ class OPSDTrainer(SFTTrainer):
         """
         Perform a training step with self-distillation.
 
+        If off_policy=True, the completion trajectory comes from the dataset instead of
+        being sampled from the current student policy.
+
         If reason_first=True:
         1. Generate teacher's reasoning about the solution
         2. Append reasoning to teacher prompt
-        3. Generate completions from student prompts
+        3. Generate completions from student prompts, or use reference trajectories in off-policy mode
         4. Compute JSD loss
 
         Otherwise:
-        1. Generate completions from student prompts
-        2. Construct full sequences for both student and teacher with the generation
-        3. Compute JSD loss on the generation tokens
+        1. Generate completions from student prompts, or use reference trajectories in off-policy mode
+        2. Construct full sequences for both student and teacher with the selected trajectory
+        3. Compute JSD loss on the trajectory tokens
         """
-        on_policy = True
+        on_policy = not self.off_policy
 
         # === REASONING PHASE (if enabled) ===
         if self.reason_first:
@@ -1355,8 +1380,24 @@ class OPSDTrainer(SFTTrainer):
                 inputs["teacher_prompt_attention_mask"] = teacher_attention_mask
                 inputs["teacher_prompt_length"] = teacher_prompts_with_reasoning.shape[1]
 
-        # === GENERATION PHASE ===
-        if self.use_vllm:
+        # === TRAJECTORY PHASE ===
+        if self.off_policy:
+            student_prompt_len = inputs["student_prompt_length"]
+            reference_trajectory_ids = inputs["reference_trajectory_ids"]
+            reference_trajectory_attention_mask = inputs["reference_trajectory_attention_mask"]
+
+            generated_ids = torch.cat([inputs["student_prompts"], reference_trajectory_ids], dim=1)
+            generated_attention_mask = torch.cat(
+                [inputs["student_prompt_attention_mask"], reference_trajectory_attention_mask], dim=1
+            )
+
+            prompt_texts = self.processing_class.batch_decode(
+                inputs["student_prompts"], skip_special_tokens=False
+            )
+            completion_texts = self.processing_class.batch_decode(
+                reference_trajectory_ids, skip_special_tokens=False
+            )
+        elif self.use_vllm:
             self._wake_vllm_if_needed()
             result = self._generate_on_policy_outputs_vllm(
                 inputs, self.generation_config, self.processing_class.pad_token_id
@@ -1381,14 +1422,14 @@ class OPSDTrainer(SFTTrainer):
         # Get batch-level student prompt length
         student_prompt_len = inputs["student_prompt_length"]
 
-        # Extract generation part (same slice for all examples since prompts are padded)
+        # Extract trajectory part (same slice for all examples since prompts are padded)
         generation_ids = generated_ids[:, student_prompt_len:]
 
-        # Construct student full sequence: [student_prompt][generation]
+        # Construct student full sequence: [student_prompt][trajectory]
         inputs["student_input_ids"] = generated_ids
         inputs["student_attention_mask"] = generated_attention_mask
 
-        # Construct teacher full sequence: [teacher_prompt][generation]
+        # Construct teacher full sequence: [teacher_prompt][trajectory]
         teacher_prompts = inputs["teacher_prompts"]
         teacher_full_ids = torch.cat([teacher_prompts, generation_ids], dim=1)
 
@@ -1400,7 +1441,7 @@ class OPSDTrainer(SFTTrainer):
         inputs["teacher_input_ids"] = teacher_full_ids
         inputs["teacher_attention_mask"] = teacher_attention_mask
 
-        # Create labels for generation tokens
+        # Create labels for trajectory tokens
         # Mask prompt tokens (use per-example lengths for accurate masking)
         labels = generated_ids.clone()
         for i in range(labels.shape[0]):
@@ -1422,14 +1463,15 @@ class OPSDTrainer(SFTTrainer):
                 {"step": self.state.global_step, "prompt": prompt, "completion": completion}
             )
 
-        # Occasionally print student's generation with 1% probability
+        # Occasionally print the selected trajectory with 1% probability
         if random.random() < 0.01:
             print(f"\n{'='*80}")
-            print(f"STUDENT GENERATION SAMPLE (Step {self.state.global_step}):")
+            sample_kind = "REFERENCE TRAJECTORY" if self.off_policy else "STUDENT GENERATION"
+            print(f"{sample_kind} SAMPLE (Step {self.state.global_step}):")
             print(f"{'='*80}")
             sample_idx = random.randint(0, len(prompt_texts) - 1)
             print(f"\nPrompt:\n{prompt_texts[sample_idx]}")
-            print(f"\nCompletion:\n{completion_texts[sample_idx]}")
+            print(f"\nTrajectory:\n{completion_texts[sample_idx]}")
             print(f"{'='*80}\n")
 
         loss = super().training_step(model, inputs, num_items_in_batch)

@@ -101,11 +101,8 @@ Structured hint:""",
 Requirements:
 - Preserve the full clinical logic from the original reasoning.
 - Do not copy sentences from the original reasoning.
-- Use only information supported by the input.
 - Explain how the evidence leads to the final answer.
 - Keep the explanation clear and medically specific.
-- Do not use bullet points or step numbers.
-- Return only the rewritten explanation.
 
 Question:
 {question}
@@ -155,6 +152,14 @@ def parse_args():
         "--output-dir",
         default=DEFAULT_OUTPUT_DIR,
         help=f"Directory to save the generated JSON output. Default: {DEFAULT_OUTPUT_DIR}.",
+    )
+    parser.add_argument(
+        "--output-file",
+        default=None,
+        help=(
+            "Optional JSONL file to append generated results to. "
+            "Use this for sharded parallel generation."
+        ),
     )
     parser.add_argument(
         "--no-save",
@@ -357,8 +362,14 @@ def main():
     )
 
     if not args.no_save:
+        output_file = Path(args.output_file) if args.output_file else None
+        if output_file is not None:
+            output_file.parent.mkdir(parents=True, exist_ok=True)
         output_dir = Path(args.output_dir)
-        output_dir.mkdir(parents=True, exist_ok=True)
+        if output_file is None:
+            output_dir.mkdir(parents=True, exist_ok=True)
+    else:
+        output_file = None
 
     total_requests = 0
     total_seconds = 0.0
@@ -434,6 +445,10 @@ def main():
             "generated_hints": outputs,
             "cost_details": cost_details,
         }
+        if len(outputs) == 1:
+            only_hint_type = next(iter(outputs))
+            result["hint_type"] = only_hint_type
+            result["teacher_context"] = outputs[only_hint_type]
         if errors:
             result["errors"] = errors
         if raw_responses:
@@ -447,11 +462,16 @@ def main():
             print(error)
 
         if not args.no_save:
-            hint_label = args.hint_type
-            output_path = output_dir / f"sample_{sample_index}_{hint_label}.json"
-            with output_path.open("w", encoding="utf-8") as file:
-                json.dump(result, file, indent=2, ensure_ascii=False)
-            print(f"\nSaved JSON output to: {output_path}")
+            if output_file is not None:
+                with output_file.open("a", encoding="utf-8") as file:
+                    file.write(json.dumps(result, ensure_ascii=False) + "\n")
+                print(f"\nAppended JSONL output to: {output_file}")
+            else:
+                hint_label = args.hint_type
+                output_path = output_dir / f"sample_{sample_index}_{hint_label}.json"
+                with output_path.open("w", encoding="utf-8") as file:
+                    json.dump(result, file, indent=2, ensure_ascii=False)
+                print(f"\nSaved JSON output to: {output_path}")
 
         sample_elapsed = time.monotonic() - sample_start
         print(f"\nSample {sample_index} finished in {sample_elapsed:.2f}s")

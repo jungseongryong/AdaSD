@@ -20,6 +20,9 @@ class SelfDistillationDataCollator:
         off_policy=False,
         teacher_context_column="solution",
         trajectory_column="solution",
+        final_instruction=None,
+        reason_first_prompt=None,
+        transition_prompt=None,
     ):
         self.tokenizer = tokenizer
         self.max_length = max_length
@@ -27,16 +30,20 @@ class SelfDistillationDataCollator:
         self.off_policy = off_policy
         self.teacher_context_column = teacher_context_column
         self.trajectory_column = trajectory_column
+        self.final_instruction = (
+            final_instruction
+            or "Please reason step by step, and put your final answer within \\boxed{}."
+        )
 
         # Prompt for reasoning about the solution before teaching
-        self.reason_first_prompt = (
+        self.reason_first_prompt = reason_first_prompt or (
             "\n\nThe reference reasoning above arrives at the correct answer. "
             "Please analyze this solution and explain the key reasoning steps and problem-solving strategies employed. "
             "Do NOT use <think> tags. Do NOT derive your own solution. "
             "Simply analyze and explain the reference solution provided above.\n"
         )
         # Prompt for transitioning to teaching mode after reasoning
-        self.transition_prompt = (
+        self.transition_prompt = transition_prompt or (
             "\n\nAfter reading the reference solution above, make sure you truly understand "
             "the reasoning behind each step — do not copy or paraphrase it. Now, using your "
             "own words and independent reasoning, derive the same final answer to the problem above. "
@@ -73,7 +80,7 @@ class SelfDistillationDataCollator:
             reference_trajectory = feature.get(self.trajectory_column, solution)
 
             # Student prompt: just the problem with instruction (matching evaluation format)
-            student_user_message = f"Problem: {problem}\n\nPlease reason step by step, and put your final answer within \\boxed{{}}."
+            student_user_message = f"Problem: {problem}\n\n{self.final_instruction}"
             student_messages = [{"role": "user", "content": student_user_message}]
 
             # Apply chat template for student (matching evaluation)
@@ -108,7 +115,7 @@ class SelfDistillationDataCollator:
                     f"Here is a reference solution to this problem:\n"
                     f"=== Reference Solution Begin ===\n{teacher_context}\n=== Reference Solution End ===\n"
                     f"{self.transition_prompt}\n"
-                    f"Please reason step by step, and put your final answer within \\boxed{{}}."
+                    f"{self.final_instruction}"
                 )
                 teacher_messages = [{"role": "user", "content": teacher_user_message}]
 
@@ -150,43 +157,6 @@ class SelfDistillationDataCollator:
             "student_prompt_lengths_per_example": torch.tensor(student_prompt_lengths),
         }
 
-        if self.off_policy:
-            eos = self.tokenizer.eos_token or ""
-            trajectory_texts = []
-            for trajectory in reference_trajectories:
-                trajectory = str(trajectory)
-                if eos and not trajectory.endswith(eos):
-                    trajectory = trajectory + eos
-                trajectory_texts.append(trajectory)
-
-            max_trajectory_len = max(1, self.max_length - max_student_prompt_len)
-            trajectory_encoded_no_pad = self.tokenizer(
-                trajectory_texts,
-                padding=False,
-                truncation=True,
-                max_length=max_trajectory_len,
-                add_special_tokens=False,
-            )
-            trajectory_lengths = [len(ids) for ids in trajectory_encoded_no_pad["input_ids"]]
-            max_trajectory_batch_len = max(trajectory_lengths)
-
-            trajectory_encoded = self.tokenizer(
-                trajectory_texts,
-                padding="max_length",
-                truncation=True,
-                max_length=max_trajectory_batch_len,
-                return_tensors="pt",
-                add_special_tokens=False,
-            )
-
-            result.update(
-                {
-                    "reference_trajectory_ids": trajectory_encoded["input_ids"],
-                    "reference_trajectory_attention_mask": trajectory_encoded["attention_mask"],
-                    "reference_trajectory_lengths_per_example": torch.tensor(trajectory_lengths),
-                }
-            )
-
         if self.reason_first:
             # Tokenize reasoning prompts
             reasoning_encoded_no_pad = self.tokenizer(
@@ -208,7 +178,7 @@ class SelfDistillationDataCollator:
 
             # Tokenize transition prompt (this will be appended after reasoning)
             # Don't use chat template here - just the raw text
-            transition_text = f"\n{self.transition_prompt}\nPlease reason step by step, and put your final answer within \\boxed{{}}."
+            transition_text = f"\n{self.transition_prompt}\n{self.final_instruction}"
             transition_encoded = self.tokenizer(
                 [transition_text] * batch_size,
                 padding=False,
@@ -249,6 +219,46 @@ class SelfDistillationDataCollator:
                     "teacher_prompt_attention_mask": teacher_encoded["attention_mask"],
                     "teacher_prompt_length": max_teacher_prompt_len,
                     "teacher_prompt_lengths_per_example": torch.tensor(teacher_prompt_lengths),
+                }
+            )
+
+        if self.off_policy:
+            eos = self.tokenizer.eos_token or ""
+            trajectory_texts = []
+            for trajectory in reference_trajectories:
+                trajectory = str(trajectory)
+                if eos and not trajectory.endswith(eos):
+                    trajectory = trajectory + eos
+                trajectory_texts.append(trajectory)
+
+            max_prompt_len_for_trajectory = max(
+                result["student_prompt_length"], result["teacher_prompt_length"]
+            )
+            max_trajectory_len = max(1, self.max_length - max_prompt_len_for_trajectory)
+            trajectory_encoded_no_pad = self.tokenizer(
+                trajectory_texts,
+                padding=False,
+                truncation=True,
+                max_length=max_trajectory_len,
+                add_special_tokens=False,
+            )
+            trajectory_lengths = [len(ids) for ids in trajectory_encoded_no_pad["input_ids"]]
+            max_trajectory_batch_len = max(trajectory_lengths)
+
+            trajectory_encoded = self.tokenizer(
+                trajectory_texts,
+                padding="max_length",
+                truncation=True,
+                max_length=max_trajectory_batch_len,
+                return_tensors="pt",
+                add_special_tokens=False,
+            )
+
+            result.update(
+                {
+                    "reference_trajectory_ids": trajectory_encoded["input_ids"],
+                    "reference_trajectory_attention_mask": trajectory_encoded["attention_mask"],
+                    "reference_trajectory_lengths_per_example": torch.tensor(trajectory_lengths),
                 }
             )
 

@@ -25,6 +25,7 @@ class SelfDistillationDataCollator:
         final_instruction=None,
         reason_first_prompt=None,
         transition_prompt=None,
+        student_enable_thinking=False,
     ):
         self.tokenizer = tokenizer
         self.max_length = max_length
@@ -36,6 +37,7 @@ class SelfDistillationDataCollator:
             final_instruction
             or "Please reason step by step, and put your final answer within \\boxed{}."
         )
+        self.student_enable_thinking = student_enable_thinking
 
         # Prompt for reasoning about the solution before teaching
         self.reason_first_prompt = reason_first_prompt or (
@@ -59,6 +61,7 @@ class SelfDistillationDataCollator:
         print(f"[DataCollator] Set padding_side to: {self.tokenizer.padding_side}")
         print(f"[DataCollator] Reason first mode: {self.reason_first}")
         print(f"[DataCollator] Off-policy mode: {self.off_policy}")
+        print(f"[DataCollator] Student thinking mode: {self.student_enable_thinking}")
         if self.off_policy:
             print(f"[DataCollator] Teacher context column: {self.teacher_context_column}")
             print(f"[DataCollator] Trajectory column: {self.trajectory_column}")
@@ -91,7 +94,10 @@ class SelfDistillationDataCollator:
 
             # Apply chat template for student (matching evaluation)
             student_prompt = self.tokenizer.apply_chat_template(
-                student_messages, tokenize=False, add_generation_prompt=True, enable_thinking=False
+                student_messages,
+                tokenize=False,
+                add_generation_prompt=True,
+                enable_thinking=self.student_enable_thinking,
             )
             student_prompts.append(student_prompt)
 

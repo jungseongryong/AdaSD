@@ -194,9 +194,23 @@ def resolve_model_dtype(model_args):
     return torch.bfloat16
 
 
+def normalize_optional_string(value):
+    if value is None:
+        return None
+    value = str(value).strip()
+    if value.lower() in {"", "none", "null"}:
+        return None
+    return value
+
+
 if __name__ == "__main__":
     parser = TrlParser((MedicalOPSDScriptArguments, GOLDConfig, ModelConfig))
     script_args, training_args, model_args = parser.parse_args_and_config()
+    script_args.dataset_config = normalize_optional_string(script_args.dataset_config)
+    script_args.context_column = normalize_optional_string(script_args.context_column)
+    script_args.trajectory_column_source = normalize_optional_string(
+        script_args.trajectory_column_source
+    )
 
     if script_args.fixed_teacher and not model_args.use_peft:
         raise ValueError("fixed_teacher=True requires use_peft=True.")
@@ -341,6 +355,7 @@ if __name__ == "__main__":
             "\n\nAfter studying the reference medical reasoning above, use your own clinical reasoning "
             "to answer the original medical question. Do not copy the reference verbatim:\n"
         ),
+        student_enable_thinking=script_args.assistant_format == "qwen_think",
     )
 
     trainer = OPSDTrainer(

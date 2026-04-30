@@ -138,6 +138,15 @@ def parse_args():
         help="Last sample index to process, inclusive.",
     )
     parser.add_argument(
+        "--indices-file",
+        default=None,
+        help=(
+            "Optional JSON file containing specific sample indices to process. "
+            "Accepts a JSON list of integers or objects with a sample_index field. "
+            "When set, --start-index/--end-index are ignored."
+        ),
+    )
+    parser.add_argument(
         "--hint_type",
         choices=["concise", "structured", "full_rewrite", "all"],
         default="all",
@@ -172,6 +181,50 @@ def parse_args():
         help="Save raw OpenRouter responses and continue if one hint generation fails.",
     )
     return parser.parse_args()
+
+
+def load_indices_file(path):
+    with Path(path).open(encoding="utf-8") as file:
+        data = json.load(file)
+
+    if not isinstance(data, list):
+        raise ValueError("--indices-file must contain a JSON list.")
+
+    indices = []
+    for item in data:
+        if isinstance(item, int):
+            indices.append(item)
+        elif isinstance(item, dict) and "sample_index" in item:
+            indices.append(int(item["sample_index"]))
+        else:
+            raise ValueError(
+                "--indices-file items must be integers or objects with sample_index."
+            )
+
+    unique_indices = sorted(set(indices))
+    if len(unique_indices) != len(indices):
+        print(
+            f"Removed {len(indices) - len(unique_indices)} duplicate indices "
+            "from --indices-file."
+        )
+    return unique_indices
+
+
+def load_completed_indices(path):
+    output_file = Path(path)
+    if not output_file.exists():
+        return set()
+
+    completed = set()
+    with output_file.open(encoding="utf-8") as file:
+        for line in file:
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            hint = row.get("teacher_context") or row.get("generated_hints", {}).get("full_rewrite", "")
+            if str(hint).strip():
+                completed.add(int(row["sample_index"]))
+    return completed
 
 
 def get_usage(data):
@@ -349,10 +402,18 @@ def main():
             "OPENROUTER_API_KEY is not set. Run: export OPENROUTER_API_KEY='your_key'"
         )
 
-    if args.start_index < 0:
-        raise ValueError("--start-index must be non-negative.")
-    if args.end_index < args.start_index:
-        raise ValueError("--end-index must be greater than or equal to --start-index.")
+    if args.indices_file:
+        sample_indices = load_indices_file(args.indices_file)
+        if not sample_indices:
+            raise ValueError("--indices-file did not contain any sample indices.")
+        if sample_indices[0] < 0:
+            raise ValueError("--indices-file contains a negative sample index.")
+    else:
+        if args.start_index < 0:
+            raise ValueError("--start-index must be non-negative.")
+        if args.end_index < args.start_index:
+            raise ValueError("--end-index must be greater than or equal to --start-index.")
+        sample_indices = list(range(args.start_index, args.end_index + 1))
 
     dataset = load_dataset_split()
     hint_types = (
@@ -371,9 +432,23 @@ def main():
     else:
         output_file = None
 
+    if output_file is not None:
+        completed_indices = load_completed_indices(output_file)
+        if completed_indices:
+            before_count = len(sample_indices)
+            sample_indices = [
+                sample_index
+                for sample_index in sample_indices
+                if sample_index not in completed_indices
+            ]
+            skipped_count = before_count - len(sample_indices)
+            print(
+                f"Skipping {skipped_count} completed samples already present in {output_file}."
+            )
+
     total_requests = 0
     total_seconds = 0.0
-    for sample_index in range(args.start_index, args.end_index + 1):
+    for sample_index in sample_indices:
         sample_start = time.monotonic()
         sample = format_sample(dataset, sample_index)
         outputs = {}

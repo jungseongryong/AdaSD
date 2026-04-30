@@ -1,6 +1,9 @@
 import os
+import math
 from dataclasses import dataclass, field
 
+import torch
+import torch.nn.functional as F
 import wandb
 from datasets import load_dataset
 from transformers import AutoTokenizer
@@ -69,6 +72,54 @@ class MedicalSFTScriptArguments(ScriptArguments):
             "'qwen_think' wraps reasoning in <think> tags; 'response_only' trains only on Response."
         },
     )
+    loss_variant: str = field(
+        default="trl",
+        metadata={
+            "help": "SFT loss implementation to use. 'trl' delegates to TRL SFTTrainer/SFTConfig "
+            "including --loss_type nll or --loss_type dft. 'eaft' uses entropy-adaptive token weighting."
+        },
+    )
+
+
+class EAFTSFTTrainer(SFTTrainer):
+    """SFTTrainer with Entropy-Adaptive Fine-Tuning loss.
+
+    EAFT scales each supervised token's cross-entropy by the model's normalized
+    next-token entropy. The entropy weight is detached, i.e. used as a stop-gradient
+    gate, so optimization still updates the model through the supervised CE term.
+    """
+
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        labels = inputs.get("labels")
+        if labels is None:
+            raise ValueError("EAFT loss requires labels in the trainer batch.")
+
+        model_inputs = {key: value for key, value in inputs.items() if key != "labels"}
+        outputs = model(**model_inputs)
+        logits = outputs.logits
+
+        # Causal LM convention: logits at position t predict label at position t+1.
+        shift_logits = logits[..., :-1, :].contiguous()
+        shift_labels = labels[..., 1:].contiguous()
+
+        vocab_size = shift_logits.size(-1)
+        valid_mask = shift_labels.ne(-100)
+        safe_labels = shift_labels.masked_fill(~valid_mask, 0)
+
+        # Use fp32 for stable entropy/log-prob calculations, especially under bf16 training.
+        log_probs = F.log_softmax(shift_logits.float(), dim=-1)
+        token_ce = -torch.gather(log_probs, dim=-1, index=safe_labels.unsqueeze(-1)).squeeze(-1)
+
+        probs = log_probs.exp()
+        entropy = -(probs * log_probs).sum(dim=-1)
+        entropy_weight = (entropy / math.log(vocab_size)).clamp(min=0.0, max=1.0).detach()
+
+        weighted_loss = token_ce * entropy_weight * valid_mask
+        loss = weighted_loss.sum() / valid_mask.sum().clamp_min(1)
+
+        if return_outputs:
+            return loss, outputs
+        return loss
 
 
 def _build_assistant_content(example, args):
@@ -109,6 +160,10 @@ def make_format_fn(tokenizer, script_args):
 if __name__ == "__main__":
     parser = TrlParser((MedicalSFTScriptArguments, SFTConfig, ModelConfig))
     script_args, training_args, model_args = parser.parse_args_and_config()
+    script_args.loss_variant = script_args.loss_variant.lower()
+    if script_args.loss_variant not in {"trl", "eaft"}:
+        raise ValueError("loss_variant must be one of: trl, eaft.")
+    loss_name = "eaft" if script_args.loss_variant == "eaft" else getattr(training_args, "loss_type", "trl")
 
     model_name = model_args.model_name_or_path.rstrip("/").split("/")[-1]
     lr_str = f"{training_args.learning_rate:.0e}".replace("e-0", "e-")
@@ -127,6 +182,7 @@ if __name__ == "__main__":
         full_wandb_run_name = (
             f"medical_sft_{model_name}_"
             f"{script_args.dataset_config or 'default'}_"
+            f"{loss_name}_"
             f"lr{lr_str}_"
             f"bs{effective_batch_size}_"
             f"ep{training_args.num_train_epochs}"
@@ -146,6 +202,8 @@ if __name__ == "__main__":
                 "reasoning_column": script_args.reasoning_column,
                 "response_column": script_args.response_column,
                 "assistant_format": script_args.assistant_format,
+                "loss_variant": script_args.loss_variant,
+                "trl_loss_type": getattr(training_args, "loss_type", None),
                 "learning_rate": training_args.learning_rate,
                 "per_device_train_batch_size": training_args.per_device_train_batch_size,
                 "gradient_accumulation_steps": training_args.gradient_accumulation_steps,
@@ -159,8 +217,6 @@ if __name__ == "__main__":
                 "num_processes": num_processes,
             },
         )
-
-    import torch
 
     if hasattr(model_args, "torch_dtype") and model_args.torch_dtype is not None:
         if isinstance(model_args.torch_dtype, str):
@@ -226,7 +282,15 @@ if __name__ == "__main__":
     train_dataset = split_dataset["train"]
     eval_dataset = split_dataset["test"]
 
-    trainer = SFTTrainer(
+    trainer_cls = EAFTSFTTrainer if script_args.loss_variant == "eaft" else SFTTrainer
+    if script_args.loss_variant == "eaft" and os.environ.get("LOCAL_RANK", "0") == "0":
+        print("\n" + "=" * 80)
+        print("EAFT LOSS ENABLED")
+        print("Loss = normalized_token_entropy.detach() * token_cross_entropy")
+        print("Use --loss_variant trl with --loss_type nll/dft for TRL's built-in losses.")
+        print("=" * 80 + "\n")
+
+    trainer = trainer_cls(
         model=model_args.model_name_or_path,
         args=training_args,
         train_dataset=train_dataset,

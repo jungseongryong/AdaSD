@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 import torch
 import torch.nn.functional as F
 import wandb
-from datasets import load_dataset
+from datasets import load_dataset, load_from_disk
 from transformers import AutoTokenizer
 
 from trl import (
@@ -157,9 +157,19 @@ def make_format_fn(tokenizer, script_args):
     return format_example
 
 
+def normalize_optional_string(value):
+    if value is None:
+        return None
+    value = str(value).strip()
+    if value.lower() in {"", "none", "null"}:
+        return None
+    return value
+
+
 if __name__ == "__main__":
     parser = TrlParser((MedicalSFTScriptArguments, SFTConfig, ModelConfig))
     script_args, training_args, model_args = parser.parse_args_and_config()
+    script_args.dataset_config = normalize_optional_string(script_args.dataset_config)
     script_args.loss_variant = script_args.loss_variant.lower()
     if script_args.loss_variant not in {"trl", "eaft"}:
         raise ValueError("loss_variant must be one of: trl, eaft.")
@@ -260,7 +270,11 @@ if __name__ == "__main__":
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    if script_args.dataset_config:
+    if os.path.isdir(script_args.dataset_name):
+        dataset = load_from_disk(script_args.dataset_name)
+        if script_args.dataset_split and hasattr(dataset, "keys"):
+            dataset = dataset[script_args.dataset_split]
+    elif script_args.dataset_config:
         dataset = load_dataset(script_args.dataset_name, script_args.dataset_config, split=script_args.dataset_split)
     else:
         dataset = load_dataset(script_args.dataset_name, split=script_args.dataset_split)

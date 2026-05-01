@@ -103,6 +103,20 @@ class MedicalOPSDScriptArguments(ScriptArguments):
         default=0.05,
         metadata={"help": "Clip each token's JSD loss to this value. 0 disables clipping."},
     )
+    distill_alpha: float = field(
+        default=0.0,
+        metadata={
+            "help": "CE/KD interpolation. total_loss = alpha * CE + (1 - alpha) * KD. "
+            "0 uses KD only; 1 uses CE only."
+        },
+    )
+    supervised_loss_type: str = field(
+        default="nll",
+        metadata={
+            "help": "Supervised/reference-token loss used when distill_alpha > 0. "
+            "Choose one of: nll, dft, eaft."
+        },
+    )
     use_ema_teacher: bool = field(
         default=False,
         metadata={"help": "Use an EMA copy of trainable weights as the teacher."},
@@ -121,15 +135,6 @@ class MedicalOPSDScriptArguments(ScriptArguments):
         default="Please reason step by step and provide the final medical answer clearly.",
         metadata={"help": "Instruction appended to the medical question in student and teacher prompts."},
     )
-    wandb_entity: str | None = field(
-        default=None,
-        metadata={"help": "WandB entity. Leave unset to use the default logged-in entity."},
-    )
-    wandb_project: str = field(
-        default="medical-opsd",
-        metadata={"help": "WandB project name."},
-    )
-
 
 def _build_reasoning_response(example, args):
     reasoning = str(example.get(args.reasoning_column, "") or "").strip()
@@ -211,9 +216,18 @@ if __name__ == "__main__":
     script_args.trajectory_column_source = normalize_optional_string(
         script_args.trajectory_column_source
     )
+    training_args.dataset_text_field = "solution"
+    training_args.remove_unused_columns = False
 
     if script_args.fixed_teacher and not model_args.use_peft:
         raise ValueError("fixed_teacher=True requires use_peft=True.")
+    if not 0.0 <= script_args.distill_alpha <= 1.0:
+        raise ValueError("--distill_alpha must be between 0 and 1.")
+    script_args.supervised_loss_type = script_args.supervised_loss_type.lower()
+    if script_args.supervised_loss_type not in {"nll", "dft", "eaft"}:
+        raise ValueError("--supervised_loss_type must be one of: nll, dft, eaft.")
+    if script_args.use_tinker_loss and script_args.distill_alpha > 0:
+        raise ValueError("--distill_alpha > 0 is only supported with the full-distribution KD loss.")
     if script_args.off_policy and script_args.use_tinker_loss:
         raise ValueError(
             "off_policy=True currently supports the full-vocabulary JSD/KL objective only. "
@@ -256,8 +270,8 @@ if __name__ == "__main__":
 
     if os.environ.get("LOCAL_RANK", "0") == "0":
         wandb.init(
-            entity=script_args.wandb_entity,
-            project=script_args.wandb_project,
+            entity=getattr(training_args, "wandb_entity", None),
+            project=getattr(training_args, "wandb_project", "medical-opsd"),
             name=full_wandb_run_name,
             config={
                 "model_name": model_args.model_name_or_path,
@@ -276,6 +290,8 @@ if __name__ == "__main__":
                 "max_completion_length": training_args.max_completion_length,
                 "temperature": training_args.temperature,
                 "beta": training_args.beta,
+                "distill_alpha": script_args.distill_alpha,
+                "supervised_loss_type": script_args.supervised_loss_type,
                 "lmbda": training_args.lmbda,
                 "max_length": training_args.max_length,
                 "use_peft": model_args.use_peft,
@@ -371,6 +387,8 @@ if __name__ == "__main__":
         reason_first=script_args.reason_first,
         top_k_loss=script_args.top_k_loss if script_args.top_k_loss > 0 else None,
         jsd_token_clip=script_args.jsd_token_clip if script_args.jsd_token_clip > 0 else None,
+        distill_alpha=script_args.distill_alpha,
+        supervised_loss_type=script_args.supervised_loss_type,
         use_ema_teacher=script_args.use_ema_teacher,
         ema_decay=script_args.ema_decay,
         off_policy=script_args.off_policy,

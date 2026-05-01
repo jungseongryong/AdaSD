@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import os
+import math
 import random
 import textwrap
 import warnings
@@ -140,6 +141,8 @@ class OPSDTrainer(SFTTrainer):
         reason_first: bool = False,
         top_k_loss: int | None = None,
         jsd_token_clip: float | None = None,
+        distill_alpha: float = 0.0,
+        supervised_loss_type: str = "nll",
         use_ema_teacher: bool = False,
         ema_decay: float = 0.999,
         off_policy: bool = False,
@@ -193,6 +196,14 @@ class OPSDTrainer(SFTTrainer):
         self.reason_first = reason_first
         self.top_k_loss = top_k_loss
         self.jsd_token_clip = jsd_token_clip
+        if not 0.0 <= distill_alpha <= 1.0:
+            raise ValueError("distill_alpha must be between 0 and 1.")
+        if use_thinking_machines_loss and distill_alpha > 0:
+            raise ValueError("distill_alpha > 0 is only supported with full-distribution KD loss.")
+        self.distill_alpha = distill_alpha
+        self.supervised_loss_type = supervised_loss_type.lower()
+        if self.supervised_loss_type not in {"nll", "dft", "eaft"}:
+            raise ValueError("supervised_loss_type must be one of: nll, dft, eaft.")
         self.use_ema_teacher = use_ema_teacher
         self.ema_decay = ema_decay
         self._ema_params = None  # lazily initialized on first optimizer step
@@ -494,6 +505,37 @@ class OPSDTrainer(SFTTrainer):
         else:
             return jsd
 
+    def supervised_token_loss(self, logits, labels):
+        valid_mask = labels.ne(-100)
+        safe_labels = labels.masked_fill(~valid_mask, 0)
+        num_items = valid_mask.sum().clamp_min(1)
+
+        if self.supervised_loss_type == "nll":
+            return F.cross_entropy(
+                logits.reshape(-1, logits.shape[-1]),
+                labels.reshape(-1),
+                ignore_index=-100,
+            )
+
+        log_probs = F.log_softmax(logits.float(), dim=-1)
+        target_log_probs = torch.gather(
+            log_probs,
+            dim=-1,
+            index=safe_labels.unsqueeze(-1),
+        ).squeeze(-1)
+
+        if self.supervised_loss_type == "dft":
+            per_token_loss = -target_log_probs.exp().detach() * target_log_probs
+        elif self.supervised_loss_type == "eaft":
+            probs = log_probs.exp()
+            entropy = -(probs * log_probs).sum(dim=-1)
+            entropy_weight = (entropy / math.log(logits.shape[-1])).clamp(min=0.0, max=1.0).detach()
+            per_token_loss = -target_log_probs * entropy_weight
+        else:
+            raise ValueError(f"Unknown supervised_loss_type={self.supervised_loss_type!r}")
+
+        return (per_token_loss * valid_mask).sum() / num_items
+
     def _update_ema(self):
         """Update EMA parameters after an optimizer step.
 
@@ -684,6 +726,20 @@ class OPSDTrainer(SFTTrainer):
         del outputs_student
         empty_cache()
 
+        if not self.use_thinking_machines_loss and self.distill_alpha >= 1.0:
+            loss = self.supervised_token_loss(student_logits_for_loss, shifted_labels)
+            mode = "train" if self.model.training else "eval"
+            loss_value = self.accelerator.gather_for_metrics(loss.detach()).mean().item()
+            self._metrics[mode]["supervised_loss"].append(loss_value)
+            self._metrics[mode][f"{self.supervised_loss_type}_loss"].append(loss_value)
+            self._metrics[mode]["distill_alpha"].append(self.distill_alpha)
+            del student_logits_for_loss
+            empty_cache()
+            if return_outputs:
+                minimal_output.loss = loss
+                return (loss, minimal_output)
+            return loss
+
         # === TEACHER FORWARD - Extract log-probs immediately ===
         # Choose teacher context based on mode:
         #   use_ema_teacher  → swap in EMA weights temporarily
@@ -758,6 +814,19 @@ class OPSDTrainer(SFTTrainer):
                 top_k=self.top_k_loss,
                 token_clip=self.jsd_token_clip,
             )
+            kd_loss = loss
+            if self.distill_alpha > 0:
+                supervised_loss = self.supervised_token_loss(student_logits_for_loss, shifted_labels)
+                loss = self.distill_alpha * supervised_loss + (1.0 - self.distill_alpha) * kd_loss
+                mode = "train" if self.model.training else "eval"
+                self._metrics[mode]["supervised_loss"].append(
+                    self.accelerator.gather_for_metrics(supervised_loss.detach()).mean().item()
+                )
+                self._metrics[mode]["kd_loss"].append(self.accelerator.gather_for_metrics(kd_loss.detach()).mean().item())
+                self._metrics[mode]["distill_alpha"].append(self.distill_alpha)
+                self._metrics[mode][f"{self.supervised_loss_type}_loss"].append(
+                    self.accelerator.gather_for_metrics(supervised_loss.detach()).mean().item()
+                )
             del student_logits_for_loss, teacher_logits_for_loss
 
         empty_cache()
@@ -1453,31 +1522,32 @@ class OPSDTrainer(SFTTrainer):
 
         inputs["labels"] = labels
 
-        # Log prompt and completion texts
-        self._textual_logs["prompt"].extend(gather_object(prompt_texts))
-        self._textual_logs["completion"].extend(gather_object(completion_texts))
+        if not self.off_policy:
+            # Log and save sampled generations only for on-policy runs. In off-policy
+            # mode these are dataset trajectories, so saving them is noisy and large.
+            self._textual_logs["prompt"].extend(gather_object(prompt_texts))
+            self._textual_logs["completion"].extend(gather_object(completion_texts))
 
-        # Collect generation outputs for saving
-        for prompt, completion in zip(prompt_texts, completion_texts):
-            self._generation_outputs_buffer.append(
-                {"step": self.state.global_step, "prompt": prompt, "completion": completion}
-            )
+            for prompt, completion in zip(prompt_texts, completion_texts):
+                self._generation_outputs_buffer.append(
+                    {"step": self.state.global_step, "prompt": prompt, "completion": completion}
+                )
 
-        # Occasionally print the selected trajectory with 1% probability
-        if random.random() < 0.01:
-            print(f"\n{'='*80}")
-            sample_kind = "REFERENCE TRAJECTORY" if self.off_policy else "STUDENT GENERATION"
-            print(f"{sample_kind} SAMPLE (Step {self.state.global_step}):")
-            print(f"{'='*80}")
-            sample_idx = random.randint(0, len(prompt_texts) - 1)
-            print(f"\nPrompt:\n{prompt_texts[sample_idx]}")
-            print(f"\nTrajectory:\n{completion_texts[sample_idx]}")
-            print(f"{'='*80}\n")
+            if random.random() < 0.01:
+                print(f"\n{'='*80}")
+                print(f"STUDENT GENERATION SAMPLE (Step {self.state.global_step}):")
+                print(f"{'='*80}")
+                sample_idx = random.randint(0, len(prompt_texts) - 1)
+                print(f"\nPrompt:\n{prompt_texts[sample_idx]}")
+                print(f"\nTrajectory:\n{completion_texts[sample_idx]}")
+                print(f"{'='*80}\n")
 
         loss = super().training_step(model, inputs, num_items_in_batch)
 
         # Save generation outputs every N steps
         if (
+            not self.off_policy
+            and
             self.state.global_step > 0
             and self.state.global_step % self._generation_save_frequency == 0
             and self.accelerator.sync_gradients

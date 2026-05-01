@@ -1,3 +1,10 @@
 .venv-inspect/
 __pycache__/
 *.pyc
+.venv/
+data/
+eval_results/
+logs/
+outputs/
+wandb/
+.hf_upload_recent6_metadata/
